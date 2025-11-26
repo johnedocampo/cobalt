@@ -149,6 +149,32 @@ class MediaCapabilitiesProviderImpl : public MediaCapabilitiesProvider {
     return AudioOutputManager::GetInstance()->GetAudioConfiguration(
         env, index, configuration);
   }
+  std::string FindAudioDecoder(const std::string& mime_type,
+                               int bitrate) override {
+    JNIEnv* env = AttachCurrentThread();
+    auto j_mime = ConvertUTF8ToJavaString(env, mime_type);
+    auto j_decoder_name =
+        Java_MediaCodecUtil_findAudioDecoder(env, j_mime, bitrate);
+    return ConvertJavaStringToUTF8(env, j_decoder_name.obj());
+  }
+
+  std::string FindVideoDecoder(const std::string& mime_type,
+                               bool must_support_secure,
+                               bool must_support_hdr,
+                               bool require_software_codec,
+                               bool must_support_tunnel_mode,
+                               int frame_width,
+                               int frame_height,
+                               int bitrate,
+                               int fps) override {
+    JNIEnv* env = AttachCurrentThread();
+    auto j_mime = ConvertUTF8ToJavaString(env, mime_type);
+    auto j_decoder_name = Java_MediaCodecUtil_findVideoDecoder(
+        env, j_mime, must_support_secure, must_support_hdr,
+        /*mustSupportSoftwareCodec=*/false, must_support_tunnel_mode,
+        /*decoderCacheTtlMs=*/-1, frame_width, frame_height, bitrate, fps);
+    return ConvertJavaStringToUTF8(env, j_decoder_name.obj());
+  }
   void GetCodecCapabilities(
       std::map<std::string, AudioCodecCapabilities>& audio_codec_capabilities,
       std::map<std::string, VideoCodecCapabilities>& video_codec_capabilities)
@@ -194,25 +220,13 @@ class MediaCapabilitiesProviderImpl : public MediaCapabilitiesProvider {
 };
 }  // namespace
 
-CodecCapability::CodecCapability(JNIEnv* env,
-                                 ScopedJavaLocalRef<jobject>& j_codec_info)
-    : name_(ConvertJavaStringToUTF8(
-          env,
-          Java_CodecCapabilityInfo_getDecoderName(env, j_codec_info))),
-      is_secure_required_(
-          Java_CodecCapabilityInfo_isSecureRequired(env, j_codec_info)),
-      is_secure_supported_(
-          Java_CodecCapabilityInfo_isSecureSupported(env, j_codec_info)),
-      is_tunnel_mode_required_(
-          Java_CodecCapabilityInfo_isTunnelModeRequired(env, j_codec_info)),
-      is_tunnel_mode_supported_(
-          Java_CodecCapabilityInfo_isTunnelModeSupported(env, j_codec_info)) {}
-
 AudioCodecCapability::AudioCodecCapability(
     JNIEnv* env,
     ScopedJavaLocalRef<jobject>& j_codec_info,
     ScopedJavaLocalRef<jobject>& j_audio_capabilities)
-    : CodecCapability(env, j_codec_info),
+    : name_(ConvertJavaStringToUTF8(
+          env,
+          Java_CodecCapabilityInfo_getDecoderName(env, j_codec_info))),
       supported_bitrates_([env, &j_audio_capabilities] {
         Range supported_bitrates =
             GetRange(env, j_audio_capabilities,
@@ -224,6 +238,10 @@ AudioCodecCapability::AudioCodecCapability(
   SB_CHECK(j_codec_info);
 }
 
+AudioCodecCapability::AudioCodecCapability(const std::string& name,
+                                           const Range& supported_bitrates)
+    : name_(name), supported_bitrates_(supported_bitrates) {}
+
 bool AudioCodecCapability::IsBitrateSupported(int bitrate) const {
   return supported_bitrates_.Contains(bitrate);
 }
@@ -232,7 +250,17 @@ VideoCodecCapability::VideoCodecCapability(
     JNIEnv* env,
     ScopedJavaLocalRef<jobject>& j_codec_info,
     ScopedJavaLocalRef<jobject>& j_video_capabilities)
-    : CodecCapability(env, j_codec_info),
+    : name_(ConvertJavaStringToUTF8(
+          env,
+          Java_CodecCapabilityInfo_getDecoderName(env, j_codec_info))),
+      is_secure_required_(
+          Java_CodecCapabilityInfo_isSecureRequired(env, j_codec_info)),
+      is_secure_supported_(
+          Java_CodecCapabilityInfo_isSecureSupported(env, j_codec_info)),
+      is_tunnel_mode_required_(
+          Java_CodecCapabilityInfo_isTunnelModeRequired(env, j_codec_info)),
+      is_tunnel_mode_supported_(
+          Java_CodecCapabilityInfo_isTunnelModeSupported(env, j_codec_info)),
       is_software_decoder_(
           Java_CodecCapabilityInfo_isSoftware(env, j_codec_info)),
       is_hdr_capable_(Java_CodecCapabilityInfo_isHdrCapable(env, j_codec_info)),
@@ -250,6 +278,30 @@ VideoCodecCapability::VideoCodecCapability(
           GetRange(env,
                    j_video_capabilities_,
                    &Java_MediaCodecUtil_getVideoFrameRateRange)) {}
+
+VideoCodecCapability::VideoCodecCapability(const std::string& name,
+                                           bool is_secure_required,
+                                           bool is_secure_supported,
+                                           bool is_tunnel_mode_required,
+                                           bool is_tunnel_mode_supported,
+                                           bool is_software_decoder,
+                                           bool is_hdr_capable,
+                                           const Range& supported_widths,
+                                           const Range& supported_heights,
+                                           const Range& supported_bitrates,
+                                           const Range& supported_frame_rates)
+    : name_(name),
+      is_secure_required_(is_secure_required),
+      is_secure_supported_(is_secure_supported),
+      is_tunnel_mode_required_(is_tunnel_mode_required),
+      is_tunnel_mode_supported_(is_tunnel_mode_supported),
+      is_software_decoder_(is_software_decoder),
+      is_hdr_capable_(is_hdr_capable),
+      j_video_capabilities_(nullptr),
+      supported_widths_(supported_widths),
+      supported_heights_(supported_heights),
+      supported_bitrates_(supported_bitrates),
+      supported_frame_rates_(supported_frame_rates) {}
 VideoCodecCapability::~VideoCodecCapability() = default;
 
 bool VideoCodecCapability::IsBitrateSupported(int bitrate) const {
@@ -392,11 +444,7 @@ std::string MediaCapabilitiesCache::FindAudioDecoder(
     const std::string& mime_type,
     int bitrate) {
   if (!is_enabled_) {
-    JNIEnv* env = AttachCurrentThread();
-    auto j_mime = ConvertUTF8ToJavaString(env, mime_type);
-    auto j_decoder_name =
-        Java_MediaCodecUtil_findAudioDecoder(env, j_mime, bitrate);
-    return ConvertJavaStringToUTF8(env, j_decoder_name.obj());
+    return media_capabilities_provider_->FindAudioDecoder(mime_type, bitrate);
   }
 
   std::lock_guard scoped_lock(mutex_);
@@ -424,13 +472,10 @@ std::string MediaCapabilitiesCache::FindVideoDecoder(
     int bitrate,
     int fps) {
   if (!is_enabled_) {
-    JNIEnv* env = AttachCurrentThread();
-    auto j_mime = ConvertUTF8ToJavaString(env, mime_type);
-    auto j_decoder_name = Java_MediaCodecUtil_findVideoDecoder(
-        env, j_mime, must_support_secure, must_support_hdr,
-        /*mustSupportSoftwareCodec=*/false, must_support_tunnel_mode,
-        /*decoderCacheTtlMs=*/-1, frame_width, frame_height, bitrate, fps);
-    return ConvertJavaStringToUTF8(env, j_decoder_name.obj());
+    return media_capabilities_provider_->FindVideoDecoder(
+        mime_type, must_support_secure, must_support_hdr,
+        require_software_codec, must_support_tunnel_mode, frame_width,
+        frame_height, bitrate, fps);
   }
 
   std::lock_guard scoped_lock(mutex_);

@@ -41,54 +41,42 @@ struct Range {
   bool Contains(int val) const { return val >= minimum && val <= maximum; }
 };
 
-class CodecCapability {
+class AudioCodecCapability {
  public:
-  CodecCapability(JNIEnv* env,
-                  base::android::ScopedJavaLocalRef<jobject>& j_codec_info);
-  virtual ~CodecCapability() {}
+  AudioCodecCapability(
+      JNIEnv* env,
+      base::android::ScopedJavaLocalRef<jobject>& j_codec_info,
+      base::android::ScopedJavaLocalRef<jobject>& j_audio_capabilities);
+  ~AudioCodecCapability() {}
+
+  const std::string& name() const { return name_; }
+  bool IsBitrateSupported(int bitrate) const;
+
+ protected:
+  AudioCodecCapability(const std::string& name,
+                       const Range& supported_bitrates);
+
+ private:
+  AudioCodecCapability(const AudioCodecCapability&) = delete;
+  AudioCodecCapability& operator=(const AudioCodecCapability&) = delete;
+
+  const std::string name_;
+  const Range supported_bitrates_;
+};
+
+class VideoCodecCapability {
+ public:
+  VideoCodecCapability(
+      JNIEnv* env,
+      base::android::ScopedJavaLocalRef<jobject>& j_codec_info,
+      base::android::ScopedJavaLocalRef<jobject>& j_video_capabilities);
+  virtual ~VideoCodecCapability();
 
   const std::string& name() const { return name_; }
   bool is_secure_required() const { return is_secure_required_; }
   bool is_secure_supported() const { return is_secure_supported_; }
   bool is_tunnel_mode_required() const { return is_tunnel_mode_required_; }
   bool is_tunnel_mode_supported() const { return is_tunnel_mode_supported_; }
-
- private:
-  CodecCapability(const CodecCapability&) = delete;
-  CodecCapability& operator=(const CodecCapability&) = delete;
-
-  const std::string name_;
-  const bool is_secure_required_;
-  const bool is_secure_supported_;
-  const bool is_tunnel_mode_required_;
-  const bool is_tunnel_mode_supported_;
-};
-
-class AudioCodecCapability : public CodecCapability {
- public:
-  AudioCodecCapability(
-      JNIEnv* env,
-      base::android::ScopedJavaLocalRef<jobject>& j_codec_info,
-      base::android::ScopedJavaLocalRef<jobject>& j_audio_capabilities);
-  ~AudioCodecCapability() override {}
-
-  bool IsBitrateSupported(int bitrate) const;
-
- private:
-  AudioCodecCapability(const AudioCodecCapability&) = delete;
-  AudioCodecCapability& operator=(const AudioCodecCapability&) = delete;
-
-  const Range supported_bitrates_;
-};
-
-class VideoCodecCapability : public CodecCapability {
- public:
-  VideoCodecCapability(
-      JNIEnv* env,
-      base::android::ScopedJavaLocalRef<jobject>& j_codec_info,
-      base::android::ScopedJavaLocalRef<jobject>& j_video_capabilities);
-  ~VideoCodecCapability() override;
-
   bool is_software_decoder() const { return is_software_decoder_; }
   bool is_hdr_capable() const { return is_hdr_capable_; }
 
@@ -98,14 +86,33 @@ class VideoCodecCapability : public CodecCapability {
   // VideoCapabilities.areSizeAndRateSupported() or
   // VideoCapabilities.isSizeSupported() will be used to check the
   // supportability.
-  bool AreResolutionAndRateSupported(int frame_width,
-                                     int frame_height,
-                                     int fps) const;
+  virtual bool AreResolutionAndRateSupported(int frame_width,
+                                             int frame_height,
+                                             int fps) const;
+
+ protected:
+  // Constructor used to create mock VideoCodecCapability objects.
+  VideoCodecCapability(const std::string& name,
+                       bool is_secure_required,
+                       bool is_secure_supported,
+                       bool is_tunnel_mode_required,
+                       bool is_tunnel_mode_supported,
+                       bool is_software_decoder,
+                       bool is_hdr_capable,
+                       const Range& supported_widths,
+                       const Range& supported_heights,
+                       const Range& supported_bitrates,
+                       const Range& supported_frame_rates);
 
  private:
   VideoCodecCapability(const VideoCodecCapability&) = delete;
   VideoCodecCapability& operator=(const VideoCodecCapability&) = delete;
 
+  const std::string name_;
+  const bool is_secure_required_;
+  const bool is_secure_supported_;
+  const bool is_tunnel_mode_required_;
+  const bool is_tunnel_mode_supported_;
   const bool is_software_decoder_;
   const bool is_hdr_capable_;
   const base::android::ScopedJavaGlobalRef<jobject> j_video_capabilities_;
@@ -126,6 +133,17 @@ class MediaCapabilitiesProvider {
       int index,
       SbMediaAudioConfiguration* configuration) = 0;
 
+  virtual std::string FindAudioDecoder(const std::string& mime_type,
+                                       int bitrate) = 0;
+  virtual std::string FindVideoDecoder(const std::string& mime_type,
+                                       bool must_support_secure,
+                                       bool must_support_hdr,
+                                       bool require_software_codec,
+                                       bool must_support_tunnel_mode,
+                                       int frame_width,
+                                       int frame_height,
+                                       int bitrate,
+                                       int fps) = 0;
   typedef std::vector<std::unique_ptr<AudioCodecCapability>>
       AudioCodecCapabilities;
   typedef std::vector<std::unique_ptr<VideoCodecCapability>>
