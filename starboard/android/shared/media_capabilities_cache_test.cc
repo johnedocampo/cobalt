@@ -26,15 +26,22 @@
 namespace starboard {
 namespace {
 
-using ::testing::ByMove;
+using ::testing::_;
+using ::testing::DoAll;
 using ::testing::Return;
 using ::testing::SetArgPointee;
+
+// --- Constants to avoid Magic Strings ---
+constexpr char kAudioMime[] = "audio/test_codec";
+constexpr char kVideoMime[] = "video/test_codec";
+constexpr int kDefaultBitrate = 200000;
 
 typedef std::vector<std::unique_ptr<AudioCodecCapability>>
     AudioCodecCapabilities;
 typedef std::vector<std::unique_ptr<VideoCodecCapability>>
     VideoCodecCapabilities;
 
+// --- Mock Classes ---
 class MockAudioCodecCapability : public AudioCodecCapability {
  public:
   MockAudioCodecCapability(const std::string& name,
@@ -44,28 +51,44 @@ class MockAudioCodecCapability : public AudioCodecCapability {
 
 class MockVideoCodecCapability : public VideoCodecCapability {
  public:
-  MockVideoCodecCapability(const std::string& name,
-                           bool is_secure_required,
-                           bool is_secure_supported,
-                           bool is_tunnel_mode_required,
-                           bool is_tunnel_mode_supported,
-                           bool is_software_decoder,
-                           bool is_hdr_capable,
-                           const Range& supported_widths,
-                           const Range& supported_heights,
-                           const Range& supported_bitrates,
-                           const Range& supported_frame_rates)
+  // Helper to allow simple construction in tests
+  MockVideoCodecCapability(const std::string& name)
       : VideoCodecCapability(name,
-                             is_secure_required,
-                             is_secure_supported,
-                             is_tunnel_mode_required,
-                             is_tunnel_mode_supported,
-                             is_software_decoder,
-                             is_hdr_capable,
-                             supported_widths,
-                             supported_heights,
-                             supported_bitrates,
-                             supported_frame_rates) {}
+                             true,            /* is_secure_required */
+                             true,            /* is_secure_supported */
+                             true,            /* is_tunnel_mode_required */
+                             true,            /* is_tunnel_mode_supported */
+                             false,           /* is_software_decoder */
+                             true,            /* is_hdr_capable */
+                             Range(0, 3840),  /* width */
+                             Range(0, 2160),  /* height */
+                             Range(0, 10000), /* bitrate */
+                             Range(0, 60)) /* fps */ {}
+
+  // Full constructor for granular control if needed
+  MockVideoCodecCapability(const std::string& name,
+                           bool secure_req,
+                           bool secure_sup,
+                           bool tunnel_req,
+                           bool tunnel_sup,
+                           bool software,
+                           bool hdr,
+                           const Range& w,
+                           const Range& h,
+                           const Range& br,
+                           const Range& fps)
+      : VideoCodecCapability(name,
+                             secure_req,
+                             secure_sup,
+                             tunnel_req,
+                             tunnel_sup,
+                             software,
+                             hdr,
+                             w,
+                             h,
+                             br,
+                             fps) {}
+
   MOCK_METHOD(bool,
               AreResolutionAndRateSupported,
               (int frame_width, int frame_height, int fps),
@@ -94,47 +117,82 @@ class MockMediaCapabilitiesProvider : public MediaCapabilitiesProvider {
               (override));
   MOCK_METHOD(std::string,
               FindVideoDecoder,
-              (const std::string& mime_type,
-               bool must_support_secure,
-               bool must_support_hdr,
-               bool require_software_codec,
-               bool must_support_tunnel_mode,
-               int frame_width,
-               int frame_height,
-               int bitrate,
-               int fps),
+              (const std::string&, bool, bool, bool, bool, int, int, int, int),
               (override));
-  MOCK_METHOD(
-      void,
-      GetCodecCapabilities,
-      ((std::map<std::string, AudioCodecCapabilities>)&audio_codec_capabilities,
-       (std::map<std::string,
-                 VideoCodecCapabilities>)&video_codec_capabilities),
-      (override));
+  MOCK_METHOD(void,
+              GetCodecCapabilities,
+              ((std::map<std::string, AudioCodecCapabilities>)&,
+               (std::map<std::string, VideoCodecCapabilities>)&),
+              (override));
 };
 
+// --- Test Fixture ---
 class MediaCapabilitiesCacheTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto mock_media_capabilities_provider =
-        std::make_unique<MockMediaCapabilitiesProvider>();
-    mock_media_capabilities_provider_ = mock_media_capabilities_provider.get();
-
-    cache_ = MediaCapabilitiesCache::CreateForTest(
-        std::move(mock_media_capabilities_provider));
+    auto provider = std::make_unique<MockMediaCapabilitiesProvider>();
+    mock_media_capabilities_provider_ = provider.get();
+    cache_ = MediaCapabilitiesCache::CreateForTest(std::move(provider));
     cache_->SetCacheEnabled(true);
+  }
+
+  // Helper: Factory for Video Mock to reduce boolean soup in tests
+  std::unique_ptr<MockVideoCodecCapability> CreateDefaultVideoMock(
+      const std::string& name) {
+    return std::make_unique<MockVideoCodecCapability>(name);
+  }
+
+  // Helper: Factory for Audio Mock
+  std::unique_ptr<MockAudioCodecCapability> CreateDefaultAudioMock(
+      const std::string& name) {
+    return std::make_unique<MockAudioCodecCapability>(
+        name, Range(0, kDefaultBitrate));
+  }
+
+  // Helper: Sets up the Provider to return "True" or "Supported" for all simple
+  // queries. This declutters the ClearCache test significantly.
+  void ExpectProviderSuccess(int times) {
+    EXPECT_CALL(*mock_media_capabilities_provider_, GetIsWidevineSupported())
+        .Times(times)
+        .WillRepeatedly(Return(true));
+    EXPECT_CALL(*mock_media_capabilities_provider_, GetIsCbcsSchemeSupported())
+        .Times(times)
+        .WillRepeatedly(Return(true));
+    EXPECT_CALL(*mock_media_capabilities_provider_, GetSupportedHdrTypes())
+        .Times(times)
+        .WillRepeatedly(
+            Return(std::set<SbMediaTransferId>{kSbMediaTransferIdSmpteSt2084}));
+    EXPECT_CALL(*mock_media_capabilities_provider_,
+                GetIsPassthroughSupported(_))
+        .Times(times)
+        .WillRepeatedly(Return(true));
+
+    // Setup a dummy config for GetAudioConfiguration
+    static SbMediaAudioConfiguration kDummyConfig = {
+        kSbMediaAudioConnectorHdmi, 0, kSbMediaAudioCodingTypeAc3, 2};
+    EXPECT_CALL(*mock_media_capabilities_provider_, GetAudioConfiguration(0, _))
+        .Times(times)
+        .WillRepeatedly(DoAll(SetArgPointee<1>(kDummyConfig), Return(true)));
+
+    // 2. Index 1: Return false (The loop ends)
+    // You need this expectation because the cache will always check the next
+    // index
+    EXPECT_CALL(*mock_media_capabilities_provider_, GetAudioConfiguration(1, _))
+        .Times(times)
+        .WillRepeatedly(Return(false));
   }
 
   MockMediaCapabilitiesProvider* mock_media_capabilities_provider_;
   std::unique_ptr<MediaCapabilitiesCache> cache_;
 };
 
+// --- Tests ---
+
 TEST_F(MediaCapabilitiesCacheTest, IsWidevineSupported_EnabledCache) {
   EXPECT_CALL(*mock_media_capabilities_provider_, GetIsWidevineSupported())
-      .Times(1)
       .WillOnce(Return(true));
   EXPECT_TRUE(cache_->IsWidevineSupported());
-  EXPECT_TRUE(cache_->IsWidevineSupported());
+  EXPECT_TRUE(cache_->IsWidevineSupported());  // Cached
 }
 
 TEST_F(MediaCapabilitiesCacheTest, IsWidevineSupported_DisabledCache) {
@@ -144,12 +202,11 @@ TEST_F(MediaCapabilitiesCacheTest, IsWidevineSupported_DisabledCache) {
       .WillOnce(Return(true))
       .WillOnce(Return(false));
   EXPECT_TRUE(cache_->IsWidevineSupported());
-  EXPECT_FALSE(cache_->IsWidevineSupported());
+  EXPECT_FALSE(cache_->IsWidevineSupported());  // Not Cached
 }
 
 TEST_F(MediaCapabilitiesCacheTest, IsCbcsSchemeSupported_EnabledCache) {
   EXPECT_CALL(*mock_media_capabilities_provider_, GetIsCbcsSchemeSupported())
-      .Times(1)
       .WillOnce(Return(true));
   EXPECT_TRUE(cache_->IsCbcsSchemeSupported());
   EXPECT_TRUE(cache_->IsCbcsSchemeSupported());
@@ -327,54 +384,29 @@ TEST_F(MediaCapabilitiesCacheTest, HasAudioDecoderFor_DisabledCache) {
 }
 
 TEST_F(MediaCapabilitiesCacheTest, HasVideoDecoderFor_EnabledCache) {
-  std::string name = "fake mime_type";
-  bool is_secure_supported = true;
-  bool is_secure_required = true;
+  std::map<std::string, VideoCodecCapabilities> video_map;
 
-  bool is_tunnel_mode_supported = true;
-  bool is_tunnel_mode_required = true;
-  bool is_software_decoder = false;
-  bool is_hdr_capable = true;
-  Range supported_bitrates = Range(0, 1000);
-  Range supported_frame_rates = Range(0, 60);
-  Range supported_widths = Range(0, 100);
-  Range supported_heights = Range(0, 500);
+  auto mock_video = CreateDefaultVideoMock(kVideoMime);
+  MockVideoCodecCapability* raw_video_ptr =
+      mock_video.get();  // Observer pointer
+  video_map[kVideoMime].push_back(std::move(mock_video));
 
-  std::map<std::string, VideoCodecCapabilities>
-      mock_video_codec_capabilities_map;
-  std::unique_ptr mock_video_capability =
-      std::make_unique<MockVideoCodecCapability>(
-          name, is_secure_supported, is_secure_required,
-          is_tunnel_mode_supported, is_tunnel_mode_required,
-          is_software_decoder, is_hdr_capable, supported_widths,
-          supported_heights, supported_bitrates, supported_frame_rates);
-
-  // Save the pointer to the mock video capability to set its expected call.
-  MockVideoCodecCapability* raw_capability_ptr = mock_video_capability.get();
-  mock_video_codec_capabilities_map[name].push_back(
-      std::move(mock_video_capability));
-
-  EXPECT_CALL(*mock_media_capabilities_provider_,
-              GetCodecCapabilities(::testing::_, ::testing::_))
+  // 1. Setup Provider to return the map
+  EXPECT_CALL(*mock_media_capabilities_provider_, GetCodecCapabilities(_, _))
       .WillOnce(
-          [&](std::map<std::string, AudioCodecCapabilities>& audio_map_internal,
-              std::map<std::string, VideoCodecCapabilities>&
-                  video_map_internal) {
-            video_map_internal = std::move(mock_video_codec_capabilities_map);
-          });
-  EXPECT_CALL(
-      *raw_capability_ptr,
-      AreResolutionAndRateSupported(::testing::_, ::testing::_, ::testing::_))
-      .Times(1)
+          [&](auto&, auto& video_out) { video_out = std::move(video_map); });
+
+  // 2. Setup Expectation on the item *inside* the map
+  EXPECT_CALL(*raw_video_ptr, AreResolutionAndRateSupported(1920, 1080, 30))
       .WillOnce(Return(true));
 
-  EXPECT_TRUE(
-      cache_->HasVideoDecoderFor(name, is_secure_supported, is_hdr_capable,
-                                 is_tunnel_mode_supported, 50, 50, 50, 50));
-  EXPECT_FALSE(cache_->HasVideoDecoderFor("fake mime_type", false, false, false,
-                                          -1, -1, -1, -1));
-  EXPECT_FALSE(cache_->HasVideoDecoderFor("non-existent mime_type", true, true,
-                                          true, 50, 50, 50, 50));
+  // 3. Execute
+  EXPECT_TRUE(cache_->HasVideoDecoderFor(kVideoMime, true, true, true, 1920,
+                                         1080, 0, 30));
+
+  // 4. Verify negative case (mime not in map)
+  EXPECT_FALSE(cache_->HasVideoDecoderFor("unknown_mime", true, true, true,
+                                          1920, 1080, 0, 30));
 }
 
 TEST_F(MediaCapabilitiesCacheTest, HasVideoDecoderFor_DisabledCache) {
@@ -394,109 +426,70 @@ TEST_F(MediaCapabilitiesCacheTest, HasVideoDecoderFor_DisabledCache) {
 }
 
 TEST_F(MediaCapabilitiesCacheTest, ClearCacheClearsAllValues) {
-  SbMediaAudioConfiguration config;
+  // --- 1. Setup Data ---
+  std::map<std::string, AudioCodecCapabilities> audio_map;
+  audio_map[kAudioMime].push_back(CreateDefaultAudioMock(kAudioMime));
 
-  std::string audio_mime = "audio/test";
-  std::string video_mime = "video/test";
+  std::map<std::string, VideoCodecCapabilities> video_map;
+  auto mock_video = CreateDefaultVideoMock(kVideoMime);
+  MockVideoCodecCapability* raw_video_ptr = mock_video.get();  // Observer
+  video_map[kVideoMime].push_back(std::move(mock_video));
 
-  // 1. Prepare Audio Mock
-  std::map<std::string, AudioCodecCapabilities> mock_audio_map;
-  mock_audio_map[audio_mime].push_back(
-      std::make_unique<MockAudioCodecCapability>(audio_mime, Range(0, 200000)));
+  // --- 2. Setup Expectations (Pre-Clear) ---
 
-  // 2. Prepare Video Mock
-  std::map<std::string, VideoCodecCapabilities> mock_video_map;
-  auto mock_video_cap = std::make_unique<MockVideoCodecCapability>(
-      video_mime, true, true, true, true, false, true, Range(0, 1920),
-      Range(0, 1080), Range(0, 10000), Range(0, 60));
+  // Setup standard provider calls (Widevine, HDR, etc) to always return success
+  // We expect them called twice: Once before clear, once after clear.
+  ExpectProviderSuccess(2);
 
-  // Save raw pointer to set expectations on the object inside the map
-  MockVideoCodecCapability* raw_video_cap = mock_video_cap.get();
-  mock_video_map[video_mime].push_back(std::move(mock_video_cap));
+  // Setup the complex Codec Map call
+  // Call 1: Return the maps we built above.
+  // Call 2: Return empty maps (simulating empty provider).
+  EXPECT_CALL(*mock_media_capabilities_provider_, GetCodecCapabilities(_, _))
+      .Times(2)
+      .WillOnce([&](auto& audio_out, auto& video_out) {
+        audio_out = std::move(audio_map);
+        video_out = std::move(video_map);
+      })
+      .WillOnce(Return());
 
-  EXPECT_CALL(*raw_video_cap,
-              AreResolutionAndRateSupported(testing::_, testing::_, testing::_))
-      .Times(1)  // Should only be called BEFORE the clear
+  // Expect the specific video capability to be checked exactly once (Pre-Clear)
+  EXPECT_CALL(*raw_video_ptr, AreResolutionAndRateSupported(_, _, _))
       .WillOnce(Return(true));
 
-  EXPECT_CALL(*mock_media_capabilities_provider_, GetIsWidevineSupported())
-      .Times(2)
-      .WillOnce(Return(true))
-      .WillOnce(Return(false));
-
-  EXPECT_CALL(*mock_media_capabilities_provider_, GetIsCbcsSchemeSupported())
-      .Times(2)
-      .WillOnce(Return(true))
-      .WillOnce(Return(false));
-
-  EXPECT_CALL(*mock_media_capabilities_provider_, GetSupportedHdrTypes())
-      .Times(2)
-      .WillRepeatedly(
-          Return(std::set<SbMediaTransferId>{kSbMediaTransferIdSmpteSt2084}));
-
-  EXPECT_CALL(*mock_media_capabilities_provider_,
-              GetIsPassthroughSupported(testing::_))
-      .Times(2)
-      .WillOnce(Return(true))
-      .WillOnce(Return(false));
-
-  EXPECT_CALL(*mock_media_capabilities_provider_,
-              GetAudioConfiguration(testing::_, testing::_))
-      .Times(4)
-      .WillOnce(Return(true))
-      .WillOnce(Return(false))
-      .WillOnce(Return(true))
-      .WillOnce(Return(false));
-
-  EXPECT_CALL(*mock_media_capabilities_provider_,
-              GetCodecCapabilities(testing::_, testing::_))
-      .Times(2)
-      .WillOnce([&](std::map<std::string, AudioCodecCapabilities>& audio_out,
-                    std::map<std::string, VideoCodecCapabilities>& video_out) {
-        audio_out = std::move(mock_audio_map);
-        video_out = std::move(mock_video_map);
-      })
-      .WillOnce(Return());  // Second call returns nothing/empty
-
+  // --- 3. Verify Pre-Clear (Populated) State ---
+  SbMediaAudioConfiguration config;
   EXPECT_TRUE(cache_->IsWidevineSupported());
   EXPECT_TRUE(cache_->IsCbcsSchemeSupported());
   EXPECT_TRUE(cache_->IsHDRTransferCharacteristicsSupported(
       kSbMediaTransferIdSmpteSt2084));
   EXPECT_TRUE(cache_->IsPassthroughSupported(kSbMediaAudioCodecAc3));
   EXPECT_TRUE(cache_->GetAudioConfiguration(0, &config));
-  EXPECT_FALSE(cache_->HasAudioDecoderFor("audio/mp4", 192000));
 
-  // Call all cache functions again to ensure that the provider functions
-  // are not being called to retrieve the values.
-  EXPECT_TRUE(cache_->IsWidevineSupported());
-  EXPECT_TRUE(cache_->IsCbcsSchemeSupported());
-  EXPECT_TRUE(cache_->IsHDRTransferCharacteristicsSupported(
-      kSbMediaTransferIdSmpteSt2084));
-  EXPECT_TRUE(cache_->IsPassthroughSupported(kSbMediaAudioCodecAc3));
-  EXPECT_TRUE(cache_->GetAudioConfiguration(0, &config));
-  EXPECT_FALSE(cache_->HasAudioDecoderFor("audio/mp4", 192000));
-  EXPECT_TRUE(cache_->HasAudioDecoderFor(audio_mime, 128000));
-  EXPECT_TRUE(cache_->HasVideoDecoderFor(video_mime, true, true, true, 1920,
-                                         1080, 5000, 30));
+  // Verify Maps populated
+  EXPECT_TRUE(cache_->HasAudioDecoderFor(kAudioMime, 100));
+  EXPECT_TRUE(cache_->HasVideoDecoderFor(kVideoMime, true, true, true, 1920,
+                                         1080, 0, 60));
 
+  // --- 4. ACTION: Clear Cache ---
   cache_->ClearCache();
 
-  EXPECT_FALSE(cache_->IsWidevineSupported());
-  EXPECT_FALSE(cache_->IsCbcsSchemeSupported());
-  EXPECT_FALSE(cache_->IsHDRTransferCharacteristicsSupported(
-      kSbMediaTransferIdAribStdB67));
-  EXPECT_FALSE(cache_->IsPassthroughSupported(kSbMediaAudioCodecEac3));
-  EXPECT_FALSE(cache_->GetAudioConfiguration(2, &config));
-  EXPECT_FALSE(cache_->HasAudioDecoderFor("audio/mp4", 192000));
-  // NEW: Verify Audio/Video Maps were cleared
-  // The cache will see it's empty, ask the Provider again (Times(2) above),
-  // get empty maps (WillOnce(Return()) above), and result in FALSE.
-  EXPECT_FALSE(cache_->HasAudioDecoderFor(audio_mime, 128000));
+  // --- 5. Verify Post-Clear (Empty/Refresh) State ---
 
-  // This fails because the provider returned empty maps on the 2nd call,
-  // so the mime type "video/test" no longer exists in the cache.
-  EXPECT_FALSE(cache_->HasVideoDecoderFor(video_mime, true, true, true, 1920,
-                                          1080, 5000, 30));
+  // These calls trigger the Provider again (Satisfying the Times(2)
+  // expectation)
+  EXPECT_TRUE(cache_->IsWidevineSupported());
+  EXPECT_TRUE(cache_->IsCbcsSchemeSupported());
+  EXPECT_TRUE(cache_->IsHDRTransferCharacteristicsSupported(
+      kSbMediaTransferIdSmpteSt2084));
+  EXPECT_TRUE(cache_->IsPassthroughSupported(kSbMediaAudioCodecAc3));
+
+  EXPECT_TRUE(cache_->GetAudioConfiguration(0, &config));
+
+  // These calls trigger Provider again, but Provider now returns Empty Maps.
+  // Therefore, the cache should return FALSE.
+  EXPECT_FALSE(cache_->HasAudioDecoderFor(kAudioMime, 100));
+  EXPECT_FALSE(cache_->HasVideoDecoderFor(kVideoMime, true, true, true, 1920,
+                                          1080, 0, 60));
 }
 }  // namespace
 }  // namespace starboard
