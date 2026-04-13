@@ -60,6 +60,7 @@ static_assert(
 using EnableFunction = void (*)();
 using SettingsMap = WTF::HashMap<WTF::String, EnableFunction>;
 
+#if BUILDFLAG(USE_STARBOARD_MEDIA)
 const SettingsMap& GetDecoderBufferSettings() {
   static const base::NoDestructor<SettingsMap> settings({
       {kEnableMediaBufferPoolAllocatorStrategy,
@@ -69,6 +70,7 @@ const SettingsMap& GetDecoderBufferSettings() {
   });
   return *settings;
 }
+#endif  // BUILDFLAG(USE_STARBOARD_MEDIA)
 
 // Ideally this function should be moved to decoder_buffer.h.  It's kept here as
 // H5vccSettings will soon be deprecated and it's easier to remove from here.
@@ -107,7 +109,7 @@ ScriptPromise<IDLUndefined> ProcessDecoderBufferSettings(
     }
     return promise;
   }
-#endif
+#endif  // BUILDFLAG(USE_STARBOARD_MEDIA)
 
   LOG(WARNING) << name << " isn't a supported setting.";
   // An unknown setting leads to TypeError.
