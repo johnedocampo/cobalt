@@ -41,6 +41,16 @@ class VideoSurfaceHolder {
   // acquired before last holder release the surface.
   jni_zero::ScopedJavaLocalRef<jobject> AcquireVideoSurface();
 
+  // Returns the surface already acquired by this holder, without altering
+  // ownership. Returns null if this holder does not currently hold the surface.
+  //
+  // This exists because AcquireVideoSurface() intentionally returns null when
+  // the surface is already held, so a holder that needs to hand its own surface
+  // to something else (e.g. attaching it to a replacement codec) would
+  // otherwise have to release and re-acquire, briefly making the surface
+  // available to other holders.
+  jni_zero::ScopedJavaLocalRef<jobject> GetAcquiredVideoSurface();
+
   // Release the surface to make the surface available for other holder.
   void ReleaseVideoSurface();
 

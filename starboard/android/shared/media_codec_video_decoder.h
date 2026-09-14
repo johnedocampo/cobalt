@@ -144,6 +144,7 @@ class MediaCodecVideoDecoder : public VideoDecoder,
   enum class CodecTransitionState {
     kNone,
     kDraining,
+    kAwaitingFrameDrain,
     kTransitionScheduled,
   };
 
@@ -168,7 +169,7 @@ class MediaCodecVideoDecoder : public VideoDecoder,
   void OnFirstTunnelFrameReady();
   void OnTunnelModeCheckForNeedMoreInput();
 
-  void OnVideoFrameRelease();
+  void OnVideoFrameRelease(bool rendered, int64_t release_time_ns);
 
   void OnSurfaceDestroyed() override;
   void ReportError(SbPlayerError error, const std::string& error_message);
@@ -176,6 +177,9 @@ class MediaCodecVideoDecoder : public VideoDecoder,
   void ResetInternal(bool skip_flush);
 
   void PerformCodecTransition();
+
+  void ScheduleCodecTransitionIfNotAlready(int64_t delay_usec);
+  void OnCodecTransitionDrainTimeout();
 
   // These variables will be initialized inside ctor or Initialize() and will
   // not be changed during the life time of this class.
@@ -287,11 +291,21 @@ class MediaCodecVideoDecoder : public VideoDecoder,
   std::condition_variable surface_condition_variable_;
   bool surface_destroyed_ = false;  // Guarded by |surface_destroy_mutex_|.
 
-  CodecTransitionState codec_transition_state_ = CodecTransitionState::kNone;
+  std::atomic<CodecTransitionState> codec_transition_state_{
+      CodecTransitionState::kNone};
+
+  std::atomic_int outstanding_output_frames_{0};
+
+  std::atomic_int64_t latest_frame_release_time_ns_{0};
+
   VideoStreamInfo pending_codec_transition_stream_info_;
   std::vector<scoped_refptr<InputBuffer>> pending_codec_transition_buffers_;
   std::vector<scoped_refptr<InputBuffer>> pending_input_buffers_;
   int video_fps_ = 0;
+  std::atomic<int64_t> codec_transition_eos_time_{0};
+
+  std::atomic_bool codec_transition_awaiting_first_output_{false};
+  std::atomic_bool codec_transition_awaiting_first_render_{false};
 
   // The variables below are used to calculate platform max supported MediaCodec
   // output buffers.

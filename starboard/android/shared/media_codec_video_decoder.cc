@@ -38,6 +38,7 @@
 #include "starboard/common/player.h"
 #include "starboard/common/size.h"
 #include "starboard/common/string.h"
+#include "starboard/common/time.h"
 #include "starboard/configuration.h"
 #include "starboard/decode_target.h"
 #include "starboard/drm.h"
@@ -58,7 +59,15 @@ using std::placeholders::_2;
 
 class VideoFrameImpl final : public VideoFrame {
  public:
-  typedef std::function<void()> VideoFrameReleaseCallback;
+  // |rendered| is true when the frame was drawn to the output surface, and
+  // false when the buffer was handed back without being displayed.
+  // |release_time_ns| is the CLOCK_MONOTONIC system time the frame was
+  // scheduled to appear at, and is only meaningful when |rendered| is true.
+  // Note this is typically in the future: the render algorithm submits a frame
+  // up to kBufferReadyThreshold ahead of its presentation time, so the callback
+  // firing does not by itself mean the frame is on screen yet.
+  typedef std::function<void(bool /*rendered*/, int64_t /*release_time_ns*/)>
+      VideoFrameReleaseCallback;
 
   VideoFrameImpl(const DequeueOutputResult& dequeue_output_result,
                  MediaCodec* media_codec_bridge,
@@ -80,7 +89,7 @@ class VideoFrameImpl final : public VideoFrame {
       media_codec_bridge_->ReleaseOutputBuffer(dequeue_output_result_.index,
                                                false);
       if (!is_end_of_stream()) {
-        release_callback_();
+        release_callback_(/*rendered=*/false, /*release_time_ns=*/0);
       }
     }
   }
@@ -91,7 +100,7 @@ class VideoFrameImpl final : public VideoFrame {
     released_ = true;
     media_codec_bridge_->ReleaseOutputBufferAtTimestamp(
         dequeue_output_result_.index, release_time_in_nanoseconds);
-    release_callback_();
+    release_callback_(/*rendered=*/true, release_time_in_nanoseconds);
   }
 
  private:
@@ -103,6 +112,20 @@ class VideoFrameImpl final : public VideoFrame {
 
 const int64_t kInitialPrerollTimeout = 250'000;                  // 250ms
 const int64_t kNeedMoreInputCheckIntervalInTunnelMode = 50'000;  // 50ms
+
+// Upper bound on how long a mid-stream codec transition will wait for the
+// renderer to release the frames the outgoing codec already produced. A normal
+// backlog drains in well under this; exceeding it means the renderer has
+// stopped consuming (e.g. playback was paused across the transition), in which
+// case swapping late is still better than never resuming video.
+const int64_t kCodecTransitionDrainTimeout = 1'000'000;  // 1s
+
+// Upper bound on how long the swap may be held back waiting for the final
+// outgoing frame to actually reach the display. This only needs to cover
+// VideoRenderAlgorithmAndroid's kBufferReadyThreshold (50ms), which is how far
+// ahead of its presentation time a frame may be submitted; the margin guards
+// against a stale or bogus release timestamp stalling the transition.
+const int64_t kMaxCodecTransitionRenderDelay = 100'000;  // 100ms
 
 const int kInitialPrerollFrameCount = 8;
 const int kNonInitialPrerollFrameCount = 1;
@@ -532,7 +555,7 @@ void MediaCodecVideoDecoder::WriteInputBuffers(
     video_mime_ = stream_info.mime;
   }
 
-  if (codec_transition_state_ != CodecTransitionState::kNone) {
+  if (codec_transition_state_.load() != CodecTransitionState::kNone) {
     pending_codec_transition_buffers_.insert(
         pending_codec_transition_buffers_.end(), input_buffers.begin(),
         input_buffers.end());
@@ -540,7 +563,10 @@ void MediaCodecVideoDecoder::WriteInputBuffers(
   }
 
   if (input_buffer_written_ == 0) {
-    SB_DCHECK_EQ(video_fps_, 0);
+    // A mid-stream codec transition resets |input_buffer_written_| while
+    // keeping the codec it just swapped in, along with the fps that codec was
+    // configured with, so only assert this when there is no codec.
+    SB_DCHECK(media_decoder_ || video_fps_ == 0);
     first_buffer_timestamp_ = input_buffers.front()->timestamp();
 
     // If color metadata is present and is not an identity mapping, then
@@ -577,7 +603,7 @@ void MediaCodecVideoDecoder::WriteInputBuffers(
     SB_LOG(INFO)
         << "Color space change detected (HDR <-> SDR). "
            "Initiating EOS draining and pre-allocating next decoder...";
-    codec_transition_state_ = CodecTransitionState::kDraining;
+    codec_transition_state_.store(CodecTransitionState::kDraining);
     pending_codec_transition_stream_info_ = stream_info;
     pending_codec_transition_buffers_.insert(
         pending_codec_transition_buffers_.end(), input_buffers.begin(),
@@ -633,11 +659,14 @@ void MediaCodecVideoDecoder::WriteEndOfStream() {
     return;
   }
 
-  if (needs_fps_to_initialize_codec_ && video_fps_ == 0) {
-    SB_DCHECK(!media_decoder_);
-    SB_DCHECK_EQ(pending_input_buffers_.size(),
-                 static_cast<size_t>(input_buffer_written_));
-
+  // |pending_input_buffers_| is only populated by the fps estimation branch in
+  // WriteInputBuffers(), which itself only runs while there is no codec. Both
+  // conditions have to be re-checked here rather than asserted: after a
+  // mid-stream codec transition this can be reached with a live codec and an
+  // empty buffer list, and an SB_DCHECK() would compile out in devel builds,
+  // leaving front() to trap on libc++'s bounds check.
+  if (needs_fps_to_initialize_codec_ && video_fps_ == 0 && !media_decoder_ &&
+      !pending_input_buffers_.empty()) {
     auto result =
         InitializeCodec(pending_input_buffers_.front()->video_stream_info());
     if (!result) {
@@ -1088,16 +1117,56 @@ void MediaCodecVideoDecoder::ProcessOutputBuffer(
       dequeue_output_result.flags & MediaCodec::kBufferFlagEndOfStream;
 
   if (is_end_of_stream &&
-      codec_transition_state_ == CodecTransitionState::kDraining) {
-    SB_LOG(INFO) << "EOS received during codec transition draining. Scheduling "
-                    "codec transition.";
-    codec_transition_state_ = CodecTransitionState::kTransitionScheduled;
+      codec_transition_state_.load() == CodecTransitionState::kDraining) {
+    // Start of the splice gap measurement. This is the last output buffer the
+    // outgoing codec will ever produce. The markers that close the measurement
+    // are armed in PerformCodecTransition(), not here: frames released between
+    // now and the swap belong to the outgoing stream, and one of them would
+    // otherwise be reported as the new stream's first frame.
+    codec_transition_eos_time_.store(CurrentMonotonicTime());
     media_codec_bridge->ReleaseOutputBuffer(dequeue_output_result.index, false);
-    Schedule(std::bind(&MediaCodecVideoDecoder::PerformCodecTransition, this));
+
+    // The codec has no more frames to give, but the renderer is typically still
+    // holding a backlog of decoded frames from it -- everything between the
+    // current media time and the end of the outgoing stream. Swapping now would
+    // destroy the codec those frames point into, forcing the kReleaseAllFrames
+    // in PerformCodecTransition() to discard them, which is what makes the tail
+    // of the outgoing stream visibly disappear. Wait for them to drain instead.
+    const int outstanding = outstanding_output_frames_.load();
+    codec_transition_state_.store(CodecTransitionState::kAwaitingFrameDrain);
+    SB_LOG(INFO) << "codec transition: t=0us, EOS received during draining. "
+                 << "Waiting for " << outstanding
+                 << " outstanding frame(s) to be displayed before swapping.";
+
+    Schedule(
+        std::bind(&MediaCodecVideoDecoder::OnCodecTransitionDrainTimeout, this),
+        kCodecTransitionDrainTimeout);
+    if (outstanding == 0) {
+      // Nothing left to show, so nothing to wait for. Note this must be checked
+      // after the state is published, otherwise a concurrent final
+      // OnVideoFrameRelease() would see kDraining, decline to schedule, and the
+      // transition would stall until the timeout.
+      ScheduleCodecTransitionIfNotAlready(/*delay_usec=*/0);
+    }
+
     if (decoder_status_cb_) {
       decoder_status_cb_(kNeedMoreInput, NULL);
     }
     return;
+  }
+
+  // First output buffer from the incoming codec after a transition. This is
+  // the "decoded" half of the splice gap; the remainder is renderer latency.
+  if (!is_end_of_stream &&
+      codec_transition_awaiting_first_output_.exchange(false)) {
+    const int64_t eos_time = codec_transition_eos_time_.load();
+    if (eos_time != 0) {
+      SB_LOG(INFO) << "codec transition: t="
+                   << CurrentMonotonicTime() - eos_time
+                   << "us, first frame decoded by the new codec (pts "
+                   << dequeue_output_result.presentation_time_microseconds
+                   << "us).";
+    }
   }
 
   if (!is_end_of_stream) {
@@ -1118,6 +1187,14 @@ void MediaCodecVideoDecoder::ProcessOutputBuffer(
     }
   }
 
+  // Balanced by OnVideoFrameRelease(). Only non-EOS frames are counted:
+  // VideoFrameImpl skips the release callback for an end-of-stream frame, so
+  // counting one here would leave the balance permanently above zero and stall
+  // every subsequent transition until its timeout.
+  if (!is_end_of_stream) {
+    ++outstanding_output_frames_;
+  }
+
   if (fix_need_more_input_backpressure_) {
     bool need_more_input = !is_end_of_stream &&
                            number_of_pending_inputs < max_pending_inputs_size_;
@@ -1125,15 +1202,16 @@ void MediaCodecVideoDecoder::ProcessOutputBuffer(
         need_more_input ? kNeedMoreInput : kBufferFull,
         make_scoped_refptr<VideoFrameImpl>(
             dequeue_output_result, media_codec_bridge,
-            std::bind(&MediaCodecVideoDecoder::OnVideoFrameRelease, this)));
+            std::bind(&MediaCodecVideoDecoder::OnVideoFrameRelease, this, _1,
+                      _2)));
     return;
   }
 
   decoder_status_cb_(
       is_end_of_stream ? kBufferFull : kNeedMoreInput,
-      new VideoFrameImpl(
-          dequeue_output_result, media_codec_bridge,
-          std::bind(&MediaCodecVideoDecoder::OnVideoFrameRelease, this)));
+      new VideoFrameImpl(dequeue_output_result, media_codec_bridge,
+                         std::bind(&MediaCodecVideoDecoder::OnVideoFrameRelease,
+                                   this, _1, _2)));
 }
 
 void MediaCodecVideoDecoder::OnEndOfStreamWritten(
@@ -1274,11 +1352,93 @@ void MediaCodecVideoDecoder::OnTunnelModeCheckForNeedMoreInput() {
            kNeedMoreInputCheckIntervalInTunnelMode);
 }
 
-void MediaCodecVideoDecoder::OnVideoFrameRelease() {
+void MediaCodecVideoDecoder::OnVideoFrameRelease(bool rendered,
+                                                 int64_t release_time_ns) {
+  if (rendered) {
+    // Keep the furthest-out display time. Frames are normally submitted in
+    // order, but taking the maximum means an out-of-order release cannot pull
+    // the swap forward on top of a frame that is still pending.
+    int64_t previous = latest_frame_release_time_ns_.load();
+    while (release_time_ns > previous &&
+           !latest_frame_release_time_ns_.compare_exchange_weak(
+               previous, release_time_ns)) {
+    }
+  }
+
+  const int outstanding = --outstanding_output_frames_;
+  SB_DCHECK_GE(outstanding, 0);
+
+  // The renderer has let go of the last frame from the outgoing codec, so
+  // nothing will reference that codec again. It is not safe to swap yet: the
+  // frame has been submitted with a presentation time that may still be in the
+  // future. Hold the swap until then, otherwise we take the output surface away
+  // from the very frames this wait exists to preserve.
+  if (outstanding == 0 && codec_transition_state_.load() ==
+                              CodecTransitionState::kAwaitingFrameDrain) {
+    const int64_t now_usec = CurrentMonotonicTime();
+    const int64_t last_display_usec =
+        latest_frame_release_time_ns_.load() / 1000;
+    // Clamp: a stale or bogus timestamp must not be able to stall the swap.
+    // The drain timeout cannot rescue us here, because by this point the state
+    // has already moved to kTransitionScheduled.
+    const int64_t delay_usec = std::clamp<int64_t>(
+        last_display_usec - now_usec, 0, kMaxCodecTransitionRenderDelay);
+
+    const int64_t eos_time = codec_transition_eos_time_.load();
+    if (eos_time != 0) {
+      SB_LOG(INFO) << "codec transition: t=" << now_usec - eos_time
+                   << "us, last frame of the outgoing stream submitted. "
+                      "Swapping in "
+                   << delay_usec << "us, once it has been displayed.";
+    }
+    ScheduleCodecTransitionIfNotAlready(delay_usec);
+  }
+
+  // End of the splice gap measurement. Draw() is the only path that puts a
+  // frame on the output surface, so this is the first moment the new content
+  // is actually visible. Dropped frames must not close the measurement.
+  if (rendered && codec_transition_awaiting_first_render_.exchange(false)) {
+    const int64_t eos_time = codec_transition_eos_time_.exchange(0);
+    if (eos_time != 0) {
+      SB_LOG(INFO) << "codec transition: t="
+                   << CurrentMonotonicTime() - eos_time
+                   << "us, first frame displayed. This is the total visible "
+                      "splice gap.";
+    }
+  }
+
   if (output_format_) {
     --buffered_output_frames_;
     SB_DCHECK_GE(buffered_output_frames_, 0);
   }
+}
+
+void MediaCodecVideoDecoder::ScheduleCodecTransitionIfNotAlready(
+    int64_t delay_usec) {
+  // Both the drain completing and the timeout expiring can reach here, and on
+  // different threads. Only the caller that wins this exchange may schedule the
+  // swap; the loser must do nothing.
+  CodecTransitionState expected = CodecTransitionState::kAwaitingFrameDrain;
+  if (!codec_transition_state_.compare_exchange_strong(
+          expected, CodecTransitionState::kTransitionScheduled)) {
+    return;
+  }
+  Schedule(std::bind(&MediaCodecVideoDecoder::PerformCodecTransition, this),
+           delay_usec);
+}
+
+void MediaCodecVideoDecoder::OnCodecTransitionDrainTimeout() {
+  SB_CHECK(BelongsToCurrentThread());
+  if (codec_transition_state_.load() !=
+      CodecTransitionState::kAwaitingFrameDrain) {
+    // The drain already completed normally; nothing to do.
+    return;
+  }
+  SB_LOG(WARNING) << "codec transition: timed out waiting for "
+                  << outstanding_output_frames_.load()
+                  << " outstanding frame(s) to be displayed. Swapping anyway; "
+                     "the tail of the outgoing stream will be dropped.";
+  ScheduleCodecTransitionIfNotAlready(/*delay_usec=*/0);
 }
 
 void MediaCodecVideoDecoder::OnSurfaceDestroyed() {
@@ -1349,8 +1509,30 @@ void MediaCodecVideoDecoder::ResetInternal(bool skip_flush) {
   end_of_stream_written_ = false;
   pending_input_buffers_.clear();
   pending_codec_transition_buffers_.clear();
-  codec_transition_state_ = CodecTransitionState::kNone;
+  codec_transition_state_.store(CodecTransitionState::kNone);
   pending_codec_transition_stream_info_ = VideoStreamInfo();
+  // |next_media_decoder_| must be released here too. This function only calls
+  // TeardownCodec() (which would have released it) when the flush path fails,
+  // so on a successful flush a pre-allocated codec would otherwise outlive the
+  // transition it belonged to. That both pins a scarce codec instance and makes
+  // the next PreallocateNextCodec() early-return, warm-swapping in a codec
+  // configured for the previous color space.
+  next_media_decoder_.reset();
+
+  // The renderer drops its frames during a reset, and
+  // MediaCodecDecoder::Flush() reclaims the output buffers wholesale, so the
+  // balancing OnVideoFrameRelease() calls for frames still in flight may never
+  // arrive. Left alone the counter would stay positive forever and every
+  // subsequent transition would stall until its drain timeout.
+  outstanding_output_frames_.store(0);
+  latest_frame_release_time_ns_.store(0);
+
+  // Abandon any in-flight splice gap measurement. A seek during a transition
+  // discards the frames that measurement was waiting on, so leaving it armed
+  // would attribute an unrelated later frame to this transition.
+  codec_transition_eos_time_.store(0);
+  codec_transition_awaiting_first_output_.store(false);
+  codec_transition_awaiting_first_render_.store(false);
 
   // TODO: We rely on VideoRenderAlgorithmTunneled::Seek() to be called inside
   //       VideoRenderer::Seek() after calling MediaCodecVideoDecoder::Reset()
@@ -1360,20 +1542,52 @@ void MediaCodecVideoDecoder::ResetInternal(bool skip_flush) {
 
 void MediaCodecVideoDecoder::PerformCodecTransition() {
   SB_CHECK(BelongsToCurrentThread());
-  if (codec_transition_state_ != CodecTransitionState::kTransitionScheduled) {
+  if (codec_transition_state_.load() !=
+      CodecTransitionState::kTransitionScheduled) {
     return;
   }
 
   SB_LOG(INFO)
       << "Performing warm swap transition for mid-stream codec transition.";
 
+  // Arm the splice gap markers here rather than at end-of-stream. Everything
+  // released during kAwaitingFrameDrain belongs to the outgoing stream, and
+  // would otherwise close the measurement with a frame the viewer was always
+  // going to see.
+  codec_transition_awaiting_first_output_.store(true);
+  codec_transition_awaiting_first_render_.store(true);
+
+  // Release any frames the renderer is still holding *before* the codec they
+  // point into is destroyed. Normally the drain wait has already brought this
+  // to zero and this is a no-op, but on the timeout path there can be
+  // stragglers, and ~VideoFrameImpl calls ReleaseOutputBuffer() on the raw
+  // MediaCodec* it captured.
+  if (decoder_status_cb_) {
+    decoder_status_cb_(kReleaseAllFrames, NULL);
+  }
+
+  const auto& new_color_metadata_value =
+      pending_codec_transition_stream_info_.color_metadata;
+  const std::optional<SbMediaColorMetadata> new_color_metadata =
+      !IsIdentity(new_color_metadata_value)
+          ? std::make_optional(new_color_metadata_value)
+          : std::nullopt;
+
   if (next_media_decoder_) {
-    SB_LOG(INFO) << "Warm swap: attaching next_media_decoder_ to main display "
-                    "surface (<2ms).";
     std::unique_ptr<MediaCodecDecoder> next_decoder =
         std::move(next_media_decoder_);
-    TeardownCodec();
 
+    // Capture the output surface BEFORE tearing anything down.
+    //
+    // The surface and the SbDecodeTarget both have to survive the swap, since
+    // the whole point is to hand them straight to the pre-allocated codec.
+    // TeardownCodec() would release the surface and destroy the decode target,
+    // so it must not be used here:
+    //   - in decode-to-texture mode it nulls |decode_target_|, so reading
+    //     decode_target_->surface() afterwards always yields null and the warm
+    //     swap silently never happens;
+    //   - in punch-out mode it releases the global video surface, briefly
+    //     making it available to other holders before we take it back.
     JNIEnv* env = AttachCurrentThread();
     jni_zero::ScopedJavaLocalRef<jobject> j_output_surface;
     switch (output_mode_) {
@@ -1381,10 +1595,8 @@ void MediaCodecVideoDecoder::PerformCodecTransition() {
         if (surface_view_) {
           j_output_surface = surface_view_.AsLocalRef(env);
         } else {
-          j_output_surface = AcquireVideoSurface();
-        }
-        if (j_output_surface) {
-          owns_video_surface_ = true;
+          // Already owned by this decoder; read it back without releasing.
+          j_output_surface = GetAcquiredVideoSurface();
         }
       } break;
       case kSbPlayerOutputModeDecodeToTexture: {
@@ -1398,14 +1610,27 @@ void MediaCodecVideoDecoder::PerformCodecTransition() {
         break;
     }
 
+    // Destroy only the outgoing codec. The surface and decode target stay.
+    media_decoder_.reset();
+
     if (j_output_surface && next_decoder->SetOutputSurface(j_output_surface)) {
       media_decoder_ = std::move(next_decoder);
-      SB_LOG(INFO)
-          << "Warm swap handover to main display surface succeeded (<2ms)!";
+      SB_LOG(INFO) << "codec transition: t="
+                   << CurrentMonotonicTime() - codec_transition_eos_time_.load()
+                   << "us, warm swap handover to main display surface "
+                      "succeeded.";
     } else {
       SB_LOG(WARNING) << "Failed to attach next_media_decoder_ to main "
                          "surface. Fallback to re-creation.";
       next_decoder.reset();
+      // Full teardown so InitializeCodec() starts from a clean slate, matching
+      // the non-warm-swap path below.
+      TeardownCodec();
+      // InitializeCodec() reads |color_metadata_| to decide whether to
+      // configure an HDR codec, and TeardownCodec() just cleared it. It has to
+      // be applied here, before the call, or the fallback rebuilds an SDR codec
+      // for HDR content.
+      color_metadata_ = new_color_metadata;
       auto result = InitializeCodec(pending_codec_transition_stream_info_);
       if (!result) {
         ReportError(kSbPlayerErrorDecode,
@@ -1418,29 +1643,64 @@ void MediaCodecVideoDecoder::PerformCodecTransition() {
     TeardownCodec();
   }
 
-  const auto& color_metadata =
-      pending_codec_transition_stream_info_.color_metadata;
-  color_metadata_ = !IsIdentity(color_metadata)
-                        ? std::make_optional(color_metadata)
-                        : std::nullopt;
+  color_metadata_ = new_color_metadata;
 
   first_buffer_timestamp_ = 0;
   input_buffer_written_ = 0;
-  video_fps_ = 0;
+  // |video_fps_| must only be cleared when we come out of here without a
+  // codec. Both the warm swap and the fallback leave a codec that was already
+  // configured with the current fps, and when
+  // |needs_fps_to_initialize_codec_| is set (AV1 on a device that caps 8k at
+  // 30fps) a zero fps means "no codec yet, still estimating". Clearing it
+  // while holding a live codec puts the decoder in a state it has no path out
+  // of: WriteInputBuffers() skips the estimation branch because
+  // |media_decoder_| is non-null, so nothing ever refills |video_fps_| or
+  // |pending_input_buffers_|, and the next WriteEndOfStream() tries to
+  // initialize a codec from an empty buffer list.
+  if (!media_decoder_) {
+    video_fps_ = 0;
+  }
+
+  // The app writes end-of-stream exactly once per seek. If it did so while the
+  // outgoing codec was draining, that EOS was consumed by the codec we just
+  // destroyed and will never be repeated, so it has to be carried over by hand.
+  // Without this the new codec decodes everything it is given but is never
+  // terminated: the renderer receives no EOS frame, the player never reaches
+  // kSbPlayerStateEndOfStream, and playback hangs at the end of the new stream.
+  const bool end_of_stream_pending = end_of_stream_written_;
   end_of_stream_written_ = false;
 
-  codec_transition_state_ = CodecTransitionState::kNone;
+  codec_transition_state_.store(CodecTransitionState::kNone);
   VideoStreamInfo stream_info = pending_codec_transition_stream_info_;
   pending_codec_transition_stream_info_ = VideoStreamInfo();
 
-  if (decoder_status_cb_) {
-    decoder_status_cb_(kReleaseAllFrames, NULL);
-  }
+  // Note: kReleaseAllFrames is deliberately *not* sent here. It is sent at the
+  // top of this function, while the outgoing codec is still alive. Sending it
+  // at this point would destroy VideoFrameImpl instances holding a raw pointer
+  // to the MediaCodec that media_decoder_.reset() has already freed.
 
   if (!pending_codec_transition_buffers_.empty()) {
     InputBuffers buffers_to_write;
     buffers_to_write.swap(pending_codec_transition_buffers_);
+    SB_LOG(INFO) << "codec transition: t="
+                 << CurrentMonotonicTime() - codec_transition_eos_time_.load()
+                 << "us, writing " << buffers_to_write.size()
+                 << " buffered input buffers to the new codec.";
     WriteInputBuffers(buffers_to_write);
+  }
+
+  if (end_of_stream_pending) {
+    SB_LOG(INFO) << "codec transition: re-writing end of stream to the new "
+                    "codec, as the app already wrote it during the drain.";
+    // Re-enter WriteEndOfStream() rather than calling into |media_decoder_|
+    // directly, so the |input_buffer_written_ == 0| case (a transition with no
+    // buffered content behind it) still produces an EOS frame for the
+    // renderer, and so the fallback-to-no-codec path still gets its fps
+    // estimated before the codec is built. Both of the branches it takes on
+    // the way through are now safe mid-transition: |video_fps_| above is only
+    // cleared when there is no codec, and the estimation branch re-checks
+    // |pending_input_buffers_| instead of asserting on it.
+    WriteEndOfStream();
   }
 }
 
